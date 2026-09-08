@@ -42,10 +42,10 @@ class XrayMonitorNode {
 
   private loadConfig(): Config {
     return {
-      monitorUrl: (process.env.MONITOR_URL || "https://monitor.mahdi.im").replace(/\/+$/, ""),
+      monitorUrl: (process.env.MONITOR_URL || "https://monitor.example.com").replace(/\/+$/, ""),
       ingestSecret: process.env.INGEST_SECRET || "oximeter_shared_secret",
-      nodeName: process.env.NODE_NAME || hostname() || "Unknown-Node",
-      nodeRole: process.env.NODE_ROLE || "BRIDGE",
+      nodeName: process.env.NODE_NAME || "",
+      nodeRole: process.env.NODE_ROLE || "",
       logPath: process.env.XRAY_LOG_PATH || "/var/log/xray/current",
       flushIntervalMs: Number(process.env.FLUSH_INTERVAL_MS) || 3000,
       batchSize: Number(process.env.BATCH_SIZE) || 150,
@@ -55,13 +55,20 @@ class XrayMonitorNode {
   }
 
   public async start() {
-    console.log(`[XrayNode] Starting telemetry agent on ${this.config.nodeName} [${this.config.nodeRole}]...`);
-    console.log(`[XrayNode] Monitor Target: ${this.config.monitorUrl}/api/ingest`);
-
-    // Auto-discover identity from Remnawave if credentials provided and role/name not explicitly pinned
+    // 1. Auto-discover identity directly from Remnawave REST API if credentials are provided
     if (this.config.remnawaveUrl && this.config.remnawaveToken) {
       await this.autoDiscoverTopology();
     }
+
+    if (!this.config.nodeName) {
+      this.config.nodeName = hostname() || "Unknown-Node";
+    }
+    if (!this.config.nodeRole) {
+      this.config.nodeRole = "BRIDGE";
+    }
+
+    console.log(`[XrayNode] Starting telemetry agent for ${this.config.nodeName} [${this.config.nodeRole}]...`);
+    console.log(`[XrayNode] Monitor Target: ${this.config.monitorUrl}/api/ingest`);
 
     this.resolveAndTailLog();
 
@@ -76,14 +83,15 @@ class XrayMonitorNode {
       const url = `${this.config.remnawaveUrl.replace(/\/+$/, "")}/nodes`;
       const res = await fetch(url, {
         headers: { Authorization: `Bearer ${this.config.remnawaveToken}` },
+        signal: AbortSignal.timeout(5000),
       });
       if (!res.ok) return;
 
       const data: any = await res.json();
-      const nodes: any[] = data.response?.nodes || data.response || [];
-      if (!Array.isArray(nodes)) return;
+      const nodes: any[] = Array.isArray(data.response) ? data.response : (data.response?.nodes || []);
+      if (!Array.isArray(nodes) || nodes.length === 0) return;
 
-      // Match by local network IP
+      // Collect local network IPs
       const localIps = new Set<string>();
       const ifaces = networkInterfaces();
       for (const list of Object.values(ifaces)) {
@@ -93,17 +101,40 @@ class XrayMonitorNode {
         }
       }
 
-      for (const n of nodes) {
-        if (localIps.has(n.address) || n.name?.toLowerCase().includes(hostname().toLowerCase())) {
-          this.config.nodeName = n.name;
-          const isTunnel = (n.name || "").toLowerCase().includes("tunnel") || (n.name || "").startsWith("IR");
-          this.config.nodeRole = isTunnel ? "TUNNEL" : "BRIDGE";
-          console.log(`[XrayNode] Auto-detected from Remnawave: Name=${n.name}, Role=${this.config.nodeRole}, Address=${n.address}`);
-          break;
-        }
+      let matched = nodes.find((n) => localIps.has(n.address));
+
+      // If not matched on local interfaces, try public IP check
+      if (!matched) {
+        try {
+          const pubRes = await fetch("https://api.ipify.org?format=json", { signal: AbortSignal.timeout(3000) });
+          if (pubRes.ok) {
+            const pubData: any = await pubRes.json();
+            if (pubData.ip) {
+              localIps.add(pubData.ip);
+              matched = nodes.find((n) => n.address === pubData.ip);
+            }
+          }
+        } catch {}
+      }
+
+      // Fallback match by hostname
+      if (!matched) {
+        matched = nodes.find((n) => n.name?.toLowerCase().includes(hostname().toLowerCase()));
+      }
+
+      if (matched) {
+        this.config.nodeName = matched.name;
+        const isTunnel =
+          (matched.tags && Array.isArray(matched.tags) && matched.tags.includes("TUNNEL")) ||
+          (matched.name || "").toLowerCase().includes("tunnel") ||
+          matched.countryCode === "IR";
+        this.config.nodeRole = isTunnel ? "TUNNEL" : "BRIDGE";
+        console.log(
+          `[XrayNode] Successfully auto-detected from Remnawave REST API: Name=${matched.name}, Role=${this.config.nodeRole}, Address=${matched.address}`
+        );
       }
     } catch (e: any) {
-      console.warn(`[XrayNode] Remnawave auto-discovery skipped: ${e.message}`);
+      console.warn(`[XrayNode] Remnawave auto-discovery warning: ${e.message}`);
     }
   }
 
