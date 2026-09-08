@@ -33,6 +33,7 @@ class XrayMonitorNode {
   private currentFd: number | null = null;
   private currentFilePath = "";
   private isSending = false;
+  private lastPingTime = 0;
 
   constructor() {
     this.config = this.loadConfig();
@@ -127,7 +128,7 @@ class XrayMonitorNode {
 
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed || !trimmed.includes("accepted tcp:")) continue;
+        if (!trimmed || (!trimmed.includes("accepted tcp:") && !trimmed.includes("accepted udp:"))) continue;
 
         const match = trimmed.match(LOG_PATTERN);
         if (match) {
@@ -154,7 +155,11 @@ class XrayMonitorNode {
   }
 
   private async flushQueue() {
-    if (this.isSending || this.queue.length === 0) return;
+    if (this.isSending) return;
+    const now = Date.now();
+    if (this.queue.length === 0 && now - this.lastPingTime < 10000) {
+      return;
+    }
     this.isSending = true;
 
     const batch = this.queue.splice(0, this.config.batchSize);
@@ -178,7 +183,9 @@ class XrayMonitorNode {
         body: JSON.stringify(payload),
       });
 
-      if (!res.ok) {
+      if (res.ok) {
+        this.lastPingTime = now;
+      } else {
         const errText = await res.text().catch(() => "");
         console.warn(`[XrayNode] Ingest returned ${res.status}: ${errText.slice(0, 100)}`);
         if (res.status >= 500 || res.status === 429) {
