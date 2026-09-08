@@ -1,5 +1,5 @@
-import { openSync, readSync, statSync, watch, existsSync, readdirSync } from "node:fs";
-import { networkInterfaces, hostname } from "node:os";
+import { openSync, readSync, statSync, watch, existsSync } from "node:fs";
+import { hostname } from "node:os";
 
 interface Config {
   monitorUrl: string;
@@ -9,8 +9,6 @@ interface Config {
   logPath: string;
   flushIntervalMs: number;
   batchSize: number;
-  remnawaveUrl?: string;
-  remnawaveToken?: string;
 }
 
 interface ConnectionRecord {
@@ -42,33 +40,19 @@ class XrayMonitorNode {
 
   private loadConfig(): Config {
     return {
-      monitorUrl: (process.env.MONITOR_URL || "https://monitor.example.com").replace(/\/+$/, ""),
+      monitorUrl: (process.env.MONITOR_URL || "http://127.0.0.1:9922").replace(/\/+$/, ""),
       ingestSecret: process.env.INGEST_SECRET || "oximeter_shared_secret",
-      nodeName: process.env.NODE_NAME || "",
-      nodeRole: process.env.NODE_ROLE || "",
+      nodeName: process.env.NODE_NAME || hostname() || "Node",
+      nodeRole: (process.env.NODE_ROLE || "BRIDGE").toUpperCase(),
       logPath: process.env.XRAY_LOG_PATH || "/var/log/xray/current",
       flushIntervalMs: Number(process.env.FLUSH_INTERVAL_MS) || 3000,
       batchSize: Number(process.env.BATCH_SIZE) || 150,
-      remnawaveUrl: process.env.REMNAWAVE_API_URL,
-      remnawaveToken: process.env.REMNAWAVE_API_TOKEN,
     };
   }
 
   public async start() {
-    // 1. Auto-discover identity directly from Remnawave REST API if credentials are provided
-    if (this.config.remnawaveUrl && this.config.remnawaveToken) {
-      await this.autoDiscoverTopology();
-    }
-
-    if (!this.config.nodeName) {
-      this.config.nodeName = hostname() || "Unknown-Node";
-    }
-    if (!this.config.nodeRole) {
-      this.config.nodeRole = "BRIDGE";
-    }
-
     console.log(`[XrayNode] Starting telemetry agent for ${this.config.nodeName} [${this.config.nodeRole}]...`);
-    console.log(`[XrayNode] Monitor Target: ${this.config.monitorUrl}/api/ingest`);
+    console.log(`[XrayNode] Ingestion Endpoint: ${this.config.monitorUrl}/api/ingest`);
 
     this.resolveAndTailLog();
 
@@ -77,73 +61,10 @@ class XrayMonitorNode {
     }, this.config.flushIntervalMs);
   }
 
-  private async autoDiscoverTopology() {
-    if (!this.config.remnawaveUrl || !this.config.remnawaveToken) return;
-    try {
-      const url = `${this.config.remnawaveUrl.replace(/\/+$/, "")}/nodes`;
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${this.config.remnawaveToken}` },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!res.ok) return;
-
-      const data: any = await res.json();
-      const nodes: any[] = Array.isArray(data.response) ? data.response : (data.response?.nodes || []);
-      if (!Array.isArray(nodes) || nodes.length === 0) return;
-
-      // Collect local network IPs
-      const localIps = new Set<string>();
-      const ifaces = networkInterfaces();
-      for (const list of Object.values(ifaces)) {
-        if (!list) continue;
-        for (const iface of list) {
-          if (!iface.internal) localIps.add(iface.address);
-        }
-      }
-
-      let matched = nodes.find((n) => localIps.has(n.address));
-
-      // If not matched on local interfaces, try public IP check
-      if (!matched) {
-        try {
-          const pubRes = await fetch("https://api.ipify.org?format=json", { signal: AbortSignal.timeout(3000) });
-          if (pubRes.ok) {
-            const pubData: any = await pubRes.json();
-            if (pubData.ip) {
-              localIps.add(pubData.ip);
-              matched = nodes.find((n) => n.address === pubData.ip);
-            }
-          }
-        } catch {}
-      }
-
-      // Fallback match by hostname
-      if (!matched) {
-        matched = nodes.find((n) => n.name?.toLowerCase().includes(hostname().toLowerCase()));
-      }
-
-      if (matched) {
-        this.config.nodeName = matched.name;
-        const isTunnel =
-          (matched.tags && Array.isArray(matched.tags) && matched.tags.includes("TUNNEL")) ||
-          (matched.name || "").toLowerCase().includes("tunnel") ||
-          matched.countryCode === "IR";
-        this.config.nodeRole = isTunnel ? "TUNNEL" : "BRIDGE";
-        console.log(
-          `[XrayNode] Successfully auto-detected from Remnawave REST API: Name=${matched.name}, Role=${this.config.nodeRole}, Address=${matched.address}`
-        );
-      }
-    } catch (e: any) {
-      console.warn(`[XrayNode] Remnawave auto-discovery warning: ${e.message}`);
-    }
-  }
-
   private resolveAndTailLog() {
     let target = this.config.logPath;
 
-    // Check if target is a directory or doesn't exist yet
     if (!existsSync(target)) {
-      // Fallback searches
       const candidates = [
         "/var/log/xray/current",
         "/var/log/xray/access.log",
@@ -166,18 +87,16 @@ class XrayMonitorNode {
     try {
       this.currentFilePath = target;
       const stat = statSync(target);
-      this.fileOffset = Math.max(0, stat.size - 64 * 1024); // Start near tail to avoid flood on restart
+      this.fileOffset = Math.max(0, stat.size - 64 * 1024);
       this.currentFd = openSync(target, "r");
       console.log(`[XrayNode] Tailing log: ${target} (offset: ${this.fileOffset})`);
 
       this.readNewLines();
 
-      // Watch for changes
       watch(target, () => {
         this.readNewLines();
       });
 
-      // Poll periodically in case file events are missed by inotify
       setInterval(() => {
         this.readNewLines();
       }, 1000);
@@ -192,7 +111,6 @@ class XrayMonitorNode {
     try {
       const stat = statSync(this.currentFilePath);
       if (stat.size < this.fileOffset) {
-        // File rotated / truncated
         console.log(`[XrayNode] Log rotated, resetting offset to 0`);
         this.fileOffset = 0;
       }
@@ -231,7 +149,7 @@ class XrayMonitorNode {
         }
       }
     } catch (e: any) {
-      // Ignore transient read errors during rotation
+      // Ignore transient read errors
     }
   }
 
@@ -263,14 +181,12 @@ class XrayMonitorNode {
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
         console.warn(`[XrayNode] Ingest returned ${res.status}: ${errText.slice(0, 100)}`);
-        // Put back in queue if not 4xx client error
         if (res.status >= 500 || res.status === 429) {
           this.queue.unshift(...batch);
         }
       }
     } catch (e: any) {
       console.warn(`[XrayNode] Failed to send telemetry batch: ${e.message}`);
-      // Put back with cap
       if (this.queue.length < 2000) {
         this.queue.unshift(...batch);
       }
