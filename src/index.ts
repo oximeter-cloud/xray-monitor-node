@@ -1,4 +1,4 @@
-import { openSync, readSync, statSync, watch, existsSync } from "node:fs";
+import { openSync, readSync, statSync, watch, existsSync, closeSync } from "node:fs";
 import { hostname } from "node:os";
 
 interface Config {
@@ -32,6 +32,7 @@ class XrayMonitorNode {
   private fileOffset = 0;
   private currentFd: number | null = null;
   private currentFilePath = "";
+  private currentIno = 0;
   private isSending = false;
   private lastPingTime = 0;
 
@@ -88,9 +89,10 @@ class XrayMonitorNode {
     try {
       this.currentFilePath = target;
       const stat = statSync(target);
+      this.currentIno = stat.ino;
       this.fileOffset = Math.max(0, stat.size - 64 * 1024);
       this.currentFd = openSync(target, "r");
-      console.log(`[XrayNode] Tailing log: ${target} (offset: ${this.fileOffset})`);
+      console.log(`[XrayNode] Tailing log: ${target} (inode: ${this.currentIno}, offset: ${this.fileOffset})`);
 
       this.readNewLines();
 
@@ -108,11 +110,19 @@ class XrayMonitorNode {
   }
 
   private readNewLines() {
-    if (this.currentFd === null) return;
+    if (!this.currentFilePath) return;
     try {
+      if (!existsSync(this.currentFilePath)) return;
       const stat = statSync(this.currentFilePath);
-      if (stat.size < this.fileOffset) {
-        console.log(`[XrayNode] Log rotated, resetting offset to 0`);
+
+      // Check if file was rotated or truncated (different inode or smaller size)
+      if (this.currentFd === null || stat.ino !== this.currentIno || stat.size < this.fileOffset) {
+        console.log(`[XrayNode] Log rotated or replaced (inode: ${this.currentIno} -> ${stat.ino}, size: ${stat.size} vs offset: ${this.fileOffset}), reopening...`);
+        if (this.currentFd !== null) {
+          try { closeSync(this.currentFd); } catch {}
+        }
+        this.currentFd = openSync(this.currentFilePath, "r");
+        this.currentIno = stat.ino;
         this.fileOffset = 0;
       }
 
