@@ -44,10 +44,24 @@ Add `xray-monitor-node` alongside your `remnanode` service in `docker-compose.ym
 
 ```yaml
 services:
+  remnanode:
+    container_name: remnanode
+    image: remnawave/node:latest
+    network_mode: host
+    restart: always
+    volumes:
+      - ./certs:/var/lib/remnawave/configs/xray/ssl:ro
+      - ./hosts:/etc/hosts:ro
+      - xray_logs:/var/log/xray
+    environment:
+      - NODE_PORT=2222
+      - SECRET_KEY="your_secret_key"
+
   xray-monitor-node:
-    image: ghcr.io/oximeter-cloud/xray-monitor-node:latest
     container_name: xray-monitor-node
-    restart: unless-stopped
+    image: ghcr.io/oximeter-cloud/xray-monitor-node:latest
+    restart: always
+    network_mode: host
     mem_limit: 80m
     environment:
       - MONITOR_URL=http://central-monitor-ip:9922  # Or https://monitor.example.com
@@ -56,18 +70,20 @@ services:
       - NODE_ROLE=BRIDGE                            # BRIDGE or TUNNEL
       - XRAY_LOG_PATH=/var/log/xray/current
     volumes:
-      # Mount the directory or container rootfs containing Xray current log
-      - /var/log/xray:/var/log/xray:ro
+      # Read-only mount of the shared named volume (standard default)
+      - xray_logs:/var/log/xray:ro
+
+volumes:
+  xray_logs:
+    name: xray_logs
 ```
 
-### Locating the Xray Log File
+### Log Volume Architecture
 
-Depending on how `remnanode` is deployed:
-1. **Host/Volume Mount:** Mount the host path or volume mapped to `/var/log/xray`.
-2. **Container Overlayfs:** You can mount from the container's merged layer:
-   ```bash
-   -v $(docker inspect remnanode --format '{{.GraphDriver.Data.MergedDir}}')/var/log/xray:/var/log/xray:ro
-   ```
+Always use the Docker named volume `xray_logs` as shown above. Mounting `xray_logs:/var/log/xray` into `remnanode` and `xray_logs:/var/log/xray:ro` into `xray-monitor-node` ensures:
+1. **Zero Path Fragility:** No reliance on internal container overlayfs paths (`/var/lib/docker/overlay2/...`).
+2. **Persistence Across Updates:** When `remnanode` is recreated or updated, the volume survives and `xray-monitor-node` maintains uninterrupted log ingestion.
+3. **Container Isolation:** The agent only accesses logs in read-only mode (`:ro`).
 
 ## Environment Variables
 
